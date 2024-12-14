@@ -1,5 +1,5 @@
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 
 class OEECalculator:
     def __init__(self, config_file=None):
@@ -47,12 +47,17 @@ class OEECalculator:
         # Handle events with missing end timestamps (assume they end at the time range's end)
         operations_df["timestamp_end"] = operations_df["timestamp_end"].fillna(end_time)
 
-        # Calculate effective duration within the time range
+        # Calculate effective start and end times
         operations_df["effective_start"] = operations_df[["timestamp_start", pd.Timestamp(start_time)]].max(axis=1)
         operations_df["effective_end"] = operations_df[["timestamp_end", pd.Timestamp(end_time)]].min(axis=1)
+
+        # Calculate effective duration (clip to non-negative)
         operations_df["effective_duration"] = (
             (operations_df["effective_end"] - operations_df["effective_start"]).dt.total_seconds().clip(lower=0)
         )
+
+        # Remove rows where the event is completely out of bounds
+        operations_df = operations_df[operations_df["effective_duration"] > 0]
 
         # Prorate value-added time for truncated events
         operations_df["prorated_value_added_time"] = operations_df.apply(
@@ -75,8 +80,11 @@ class OEECalculator:
         Returns:
             float: Prorated value-added time in seconds.
         """
+        # Validate the value-added time from the config
         standard_value_added_time = self.value_added_times.get(operation, None)
-        if standard_value_added_time:
+        if standard_value_added_time is not None:
+            if not isinstance(standard_value_added_time, (int, float)):
+                raise ValueError(f"Value-added time for operation '{operation}' must be numeric.")
             return min(effective_duration, standard_value_added_time)
         return 0
 
@@ -97,27 +105,23 @@ class OEECalculator:
         # Apply truncation for the time range
         truncated_df = self.truncate_events(operations_df, start_time, end_time)
 
-        # Filter out operations with zero effective duration
-        truncated_df = truncated_df[truncated_df["effective_duration"] > 0]
-
         # Handle overrides for loss categories
         if overrides:
-            # Apply overrides where specified
             truncated_df["loss_category"] = truncated_df.apply(
                 lambda row: overrides.get(row["operation"], row["loss_category"]), axis=1
             )
 
-        # Calculate total duration in the time range
-        total_time = truncated_df["effective_duration"].sum()
-
-        if total_time == 0:
-            # No effective time means zero OEE components
+        # If no valid events, return zero OEE metrics
+        if truncated_df.empty:
             return {
                 "availability": 0,
                 "performance": 0,
                 "quality": 0,
                 "oee": 0,
             }
+
+        # Calculate total duration in the time range
+        total_time = truncated_df["effective_duration"].sum()
 
         # Categorize losses
         availability_losses = truncated_df[truncated_df["loss_category"].isin(
@@ -135,10 +139,10 @@ class OEECalculator:
         # Value-added time
         value_added_time = truncated_df["prorated_value_added_time"].sum()
 
-        # OEE components
-        availability = (total_time - availability_losses) / total_time
-        performance = 1 - performance_losses / total_time
-        quality = 1 - quality_losses / total_time
+        # Avoid division by zero for OEE components
+        availability = (total_time - availability_losses) / total_time if total_time > 0 else 0
+        performance = 1 - performance_losses / total_time if total_time > 0 else 0
+        quality = 1 - quality_losses / total_time if total_time > 0 else 0
 
         # Overall OEE
         oee = availability * performance * quality
