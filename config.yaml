@@ -1,0 +1,13 @@
+
+value_added_times:
+  heating: 30  # Value-added for 30 minutes
+  cooling: 20  # Value-added for 20 minutes
+  mixing: 15   # Value-added for 15 minutes
+
+loss_mappings:
+  heating: "speed loss"
+  cooling: "planned stop"
+  idle: "unplanned stop"
+  mixing: "value-added"
+  rework: "rework/scrap"
+  startup: "startup loss"
