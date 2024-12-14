@@ -25,8 +25,11 @@ class OEECalculator:
             dict: A dictionary mapping operations to value-added times.
         """
         import yaml
-        with open(config_file, 'r') as file:
-            return yaml.safe_load(file)
+        try:
+            with open(config_file, 'r') as file:
+                return yaml.safe_load(file)
+        except Exception as e:
+            raise ValueError(f"Error loading config file: {e}")
 
     def truncate_events(self, operations_df, start_time, end_time):
         """
@@ -81,12 +84,15 @@ class OEECalculator:
             float: Prorated value-added time in seconds.
         """
         # Validate the value-added time from the config
-        standard_value_added_time = self.value_added_times.get(operation, None)
-        if standard_value_added_time is not None:
-            if not isinstance(standard_value_added_time, (int, float)):
-                raise ValueError(f"Value-added time for operation '{operation}' must be numeric.")
-            return min(effective_duration, standard_value_added_time)
-        return 0
+        if operation not in self.value_added_times:
+            import warnings
+            warnings.warn(f"Operation '{operation}' not found in value-added times config. Defaulting to 0.")
+            return 0
+
+        standard_value_added_time = self.value_added_times[operation]
+        if not isinstance(standard_value_added_time, (int, float)):
+            raise ValueError(f"Value-added time for operation '{operation}' must be numeric.")
+        return min(effective_duration, standard_value_added_time)
 
     def calculate_oee(self, operations_df, start_time, end_time, overrides=None):
         """
@@ -113,6 +119,7 @@ class OEECalculator:
 
         # If no valid events, return zero OEE metrics
         if truncated_df.empty:
+            print(f"No valid operations found within the time range: {start_time} to {end_time}")
             return {
                 "availability": 0,
                 "performance": 0,
@@ -140,9 +147,9 @@ class OEECalculator:
         value_added_time = truncated_df["prorated_value_added_time"].sum()
 
         # Avoid division by zero for OEE components
-        availability = (total_time - availability_losses) / total_time if total_time > 0 else 0
-        performance = 1 - performance_losses / total_time if total_time > 0 else 0
-        quality = 1 - quality_losses / total_time if total_time > 0 else 0
+        availability = max((total_time - availability_losses) / total_time, 0)
+        performance = max(1 - performance_losses / total_time, 0)
+        quality = max(1 - quality_losses / total_time, 0)
 
         # Overall OEE
         oee = availability * performance * quality
@@ -152,4 +159,9 @@ class OEECalculator:
             "performance": round(performance, 3),
             "quality": round(quality, 3),
             "oee": round(oee, 3),
+            "value_added_time": round(value_added_time, 2),
+            "availability_losses": round(availability_losses, 2),
+            "performance_losses": round(performance_losses, 2),
+            "quality_losses": round(quality_losses, 2),
+            "total_time": round(total_time, 2),
         }
