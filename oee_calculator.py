@@ -1,113 +1,97 @@
-# oee_calculator.py
-
 import pandas as pd
-import numpy as np
-from datetime import datetime
-import yaml
 
 class OEECalculator:
-    def __init__(self, config_path):
+    def __init__(self, config_file="value_added_times.yaml"):
         """
-        Initialize the calculator with configuration for operations and value-added thresholds.
-        :param config_path: Path to the YAML/JSON config file.
+        Initialize the OEE Calculator with a configuration file.
         """
-        self.config = self.load_config(config_path)
+        self.config = self.load_config(config_file)
 
     @staticmethod
-    def load_config(config_path):
+    def load_config(config_file):
         """
-        Load configuration from a YAML/JSON file.
+        Load the YAML configuration file.
         """
-        with open(config_path, "r") as file:
+        import yaml
+        with open(config_file, "r") as file:
             return yaml.safe_load(file)
+
+    def truncate_events(self, events_df, start_time, end_time):
+        """
+        Adjust events to fit within the provided time range.
+        Handles overlapping operations and prorates value-added times.
+        """
+        # Truncate start and end times to fit within the time window
+        events_df["truncated_start"] = events_df["timestamp_start"].apply(
+            lambda x: max(x, start_time)
+        )
+        events_df["truncated_end"] = events_df["timestamp_end"].apply(
+            lambda x: min(x, end_time) if pd.notnull(x) else end_time
+        )
+
+        # Calculate actual duration within the time window
+        events_df["effective_duration"] = (
+            (events_df["truncated_end"] - events_df["truncated_start"])
+            .dt.total_seconds()
+            .clip(lower=0)
+        )
+
+        # Add a standard value-added duration column based on the config
+        events_df["standard_duration"] = events_df["operation"].map(
+            lambda op: self.config["value_added_operations"].get(op, 0) * 60  # Convert minutes to seconds
+        )
+
+        # Prorate the standard value-added time based on the effective duration
+        events_df["prorated_value_added_time"] = (
+            events_df["effective_duration"] / 
+            (events_df["timestamp_end"] - events_df["timestamp_start"]).dt.total_seconds()
+        ).fillna(1) * events_df["standard_duration"]
+
+        # Ensure valid prorated times (handle divide-by-zero or missing data issues)
+        events_df["prorated_value_added_time"] = events_df["prorated_value_added_time"].clip(lower=0)
+
+        return events_df
 
     def calculate_oee(self, operations_df, start_time, end_time):
         """
-        Calculate OEE for a given time range.
-        :param operations_df: DataFrame with batch operation data.
-        :param start_time: Start of the time range for OEE calculation.
-        :param end_time: End of the time range for OEE calculation.
-        :return: Dictionary with OEE metrics and processed data.
+        Calculate OEE metrics within a specific time range.
+        Truncates events to fit within this time range and calculates metrics.
         """
-        # Step 1: Handle missing timestamp_end
-        operations_df = self.handle_missing_timestamps(operations_df, end_time)
+        # Truncate operations to fit time range
+        truncated_df = self.truncate_events(operations_df, start_time, end_time)
 
-        # Step 2: Filter operations within the time range
-        operations_df = self.filter_time_range(operations_df, start_time, end_time)
+        # Filter out operations with zero effective duration
+        truncated_df = truncated_df[truncated_df["effective_duration"] > 0]
 
-        # Step 3: Categorize operations into value-added, delays, and losses
-        operations_df = self.categorize_operations(operations_df)
+        # Calculate total duration and categorized losses
+        total_time = truncated_df["effective_duration"].sum()
 
-        # Step 4: Calculate total time for each category
-        time_breakdown = self.calculate_time_breakdown(operations_df)
+        if total_time == 0:
+            # No effective time means zero OEE components
+            return {
+                "availability": 0,
+                "performance": 0,
+                "quality": 0,
+                "oee": 0,
+            }
 
-        # Step 5: Compute OEE metrics
-        oee_metrics = self.compute_oee_metrics(time_breakdown, end_time - start_time)
+        # Calculate categorized durations
+        grouped_durations = truncated_df.groupby("loss_category")["effective_duration"].sum()
 
-        return {
-            "oee_metrics": oee_metrics,
-            "time_breakdown": time_breakdown,
-            "processed_operations": operations_df
-        }
+        # Value-added time (prorated sum)
+        value_added_time = truncated_df["prorated_value_added_time"].sum()
 
-    def handle_missing_timestamps(self, operations_df, default_end_time):
-        """
-        Handles missing `timestamp_end` values by using the default end time or marking as ongoing.
-        """
-        operations_df['timestamp_start'] = pd.to_datetime(operations_df['timestamp_start'])
-        operations_df['timestamp_end'] = pd.to_datetime(operations_df['timestamp_end'], errors='coerce')
+        # OEE component calculations
+        availability = value_added_time / total_time if total_time else 0
+        performance = 1 - grouped_durations.get("speed_loss", 0) / total_time
+        quality = 1 - grouped_durations.get("rework/scrap", 0) / total_time
 
-        # Replace missing end timestamps with the default end time (e.g., current time)
-        ongoing_mask = operations_df['timestamp_end'].isna()
-        operations_df.loc[ongoing_mask, 'timestamp_end'] = default_end_time
+        # Overall OEE
+        oee = availability * performance * quality
 
-        # Add a flag to indicate ongoing operations
-        operations_df['is_ongoing'] = ongoing_mask
-
-        return operations_df
-
-    def filter_time_range(self, operations_df, start_time, end_time):
-        """
-        Filters operations to include only those overlapping with the time range.
-        """
-        return operations_df[
-            (operations_df['timestamp_end'] > start_time) & (operations_df['timestamp_start'] < end_time)
-        ]
-
-    def categorize_operations(self, operations_df):
-        """
-        Categorize operations based on value-added time limits and loss types.
-        """
-        def categorize(row):
-            operation = row['operation']
-            duration = (row['timestamp_end'] - row['timestamp_start']).total_seconds() / 60  # in minutes
-
-            if operation in self.config['value_added_times']:
-                limit = self.config['value_added_times'][operation]
-                return "value-added" if duration <= limit else self.config['loss_mappings'].get(operation, "unclassified")
-            return self.config['loss_mappings'].get(operation, "unclassified")
-
-        operations_df['category'] = operations_df.apply(categorize, axis=1)
-        return operations_df
-
-    def calculate_time_breakdown(self, operations_df):
-        """
-        Summarizes total time spent in each category.
-        """
-        operations_df['duration'] = (operations_df['timestamp_end'] - operations_df['timestamp_start']).dt.total_seconds()
-        time_breakdown = operations_df.groupby('category')['duration'].sum().to_dict()
-        return time_breakdown
-
-    def compute_oee_metrics(self, time_breakdown, total_time):
-        """
-        Computes OEE metrics: Availability, Performance, Quality.
-        """
-        availability = time_breakdown.get("value-added", 0) / total_time
-        performance = time_breakdown.get("value-added", 0) / (time_breakdown.get("value-added", 0) + time_breakdown.get("delay", 0))
-        quality = 1.0  # Placeholder, to be extended if quality data is available
         return {
             "availability": availability,
             "performance": performance,
             "quality": quality,
-            "oee": availability * performance * quality
+            "oee": oee,
         }
