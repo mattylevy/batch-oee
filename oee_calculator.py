@@ -3,11 +3,12 @@ from datetime import datetime
 import warnings
 import yaml
 
+
 class OEECalculator:
     def __init__(self, config_file=None):
         """
         Initialize the OEECalculator with an optional configuration file.
-        
+
         Parameters:
             config_file (str): Path to a YAML file containing value-added times for each operation.
         """
@@ -25,7 +26,7 @@ class OEECalculator:
             dict: A dictionary mapping operations to value-added times.
         """
         try:
-            with open(config_file, 'r') as file:
+            with open(config_file, "r") as file:
                 return yaml.safe_load(file)
         except FileNotFoundError:
             raise FileNotFoundError(f"Config file '{config_file}' not found.")
@@ -46,7 +47,7 @@ class OEECalculator:
         """
         # Ensure timestamps are converted to datetime objects
         operations_df["timestamp_start"] = pd.to_datetime(operations_df["timestamp_start"])
-        operations_df["timestamp_end"] = pd.to_datetime(operations_df["timestamp_end"], errors='coerce')
+        operations_df["timestamp_end"] = pd.to_datetime(operations_df["timestamp_end"], errors="coerce")
 
         # Fill missing end timestamps with the specified end_time
         operations_df["timestamp_end"] = operations_df["timestamp_end"].fillna(pd.Timestamp(end_time))
@@ -65,19 +66,24 @@ class OEECalculator:
 
         # Calculate prorated value-added time for each row
         operations_df["prorated_value_added_time"] = operations_df.apply(
-            lambda row: self.calculate_prorated_value_added_time(row["operation"], row["effective_duration"]),
-            axis=1
+            lambda row: self.calculate_prorated_value_added_time(
+                row["operation"], row["timestamp_start"], row["timestamp_end"], start_time, end_time
+            ),
+            axis=1,
         )
 
         return operations_df
 
-    def calculate_prorated_value_added_time(self, operation, effective_duration):
+    def calculate_prorated_value_added_time(self, operation, timestamp_start, timestamp_end, range_start, range_end):
         """
-        Calculate prorated value-added time for a given operation.
+        Calculate prorated value-added time for a given operation within a specific time range.
 
         Parameters:
             operation (str): The name of the operation.
-            effective_duration (float): The effective duration of the operation in seconds.
+            timestamp_start (datetime): Actual start time of the operation.
+            timestamp_end (datetime): Actual end time of the operation.
+            range_start (datetime): Start of the time range.
+            range_end (datetime): End of the time range.
 
         Returns:
             float: Prorated value-added time in seconds.
@@ -86,12 +92,21 @@ class OEECalculator:
             warnings.warn(f"Operation '{operation}' not found in value-added times config. Defaulting to 0.")
             return 0
 
+        # Get the standard value-added time for the operation
         standard_value_added_time = self.value_added_times[operation]
-        if not isinstance(standard_value_added_time, (int, float)):
-            raise ValueError(f"Value-added time for operation '{operation}' must be numeric.")
-        
-        # Return the minimum of effective duration and standard value-added time
-        return min(effective_duration, standard_value_added_time)
+
+        # Calculate expected end time using the standard value-added time
+        expected_end = timestamp_start + pd.Timedelta(seconds=standard_value_added_time)
+
+        # Determine the overlap between the expected value-added window and the specified range
+        overlap_start = max(timestamp_start, pd.Timestamp(range_start))
+        overlap_end = min(expected_end, pd.Timestamp(range_end))
+
+        # Calculate the overlap duration in seconds
+        overlap_duration = max((overlap_end - overlap_start).total_seconds(), 0)
+
+        # Return the prorated value-added time as the overlap duration
+        return overlap_duration
 
     def calculate_oee(self, operations_df, start_time, end_time, overrides=None):
         """
@@ -123,7 +138,7 @@ class OEECalculator:
                 "oee": 0,
             }
 
-        # Calculate total time in of the time range 
+        # Calculate total time in the time range
         total_time = (pd.Timestamp(end_time) - pd.Timestamp(start_time)).total_seconds()
 
         # Aggregate losses by category
