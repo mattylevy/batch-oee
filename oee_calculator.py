@@ -1,5 +1,7 @@
 import pandas as pd
 from datetime import datetime
+import warnings
+import yaml
 
 class OEECalculator:
     def __init__(self, config_file=None):
@@ -7,16 +9,14 @@ class OEECalculator:
         Initialize the OEECalculator with an optional configuration file.
         
         Parameters:
-            config_file (str): Path to a YAML or JSON file containing value-added times for each operation.
+            config_file (str): Path to a YAML file containing value-added times for each operation.
         """
-        if config_file:
-            self.value_added_times = self.load_value_added_times(config_file)
-        else:
-            self.value_added_times = {}
+        # Load value-added times if a config file is provided; default to an empty dictionary otherwise
+        self.value_added_times = self.load_value_added_times(config_file) if config_file else {}
 
     def load_value_added_times(self, config_file):
         """
-        Load value-added times from a configuration file.
+        Load value-added times from a YAML configuration file.
 
         Parameters:
             config_file (str): Path to the configuration file.
@@ -24,12 +24,13 @@ class OEECalculator:
         Returns:
             dict: A dictionary mapping operations to value-added times.
         """
-        import yaml
         try:
             with open(config_file, 'r') as file:
                 return yaml.safe_load(file)
-        except Exception as e:
-            raise ValueError(f"Error loading config file: {e}")
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Config file '{config_file}' not found.")
+        except yaml.YAMLError as e:
+            raise ValueError(f"Error parsing YAML config file: {e}")
 
     def truncate_events(self, operations_df, start_time, end_time):
         """
@@ -43,30 +44,28 @@ class OEECalculator:
         Returns:
             pd.DataFrame: DataFrame with truncated event durations and value-added times.
         """
-        # Ensure timestamps are datetime objects
+        # Ensure timestamps are converted to datetime objects
         operations_df["timestamp_start"] = pd.to_datetime(operations_df["timestamp_start"])
-        operations_df["timestamp_end"] = pd.to_datetime(operations_df["timestamp_end"])
+        operations_df["timestamp_end"] = pd.to_datetime(operations_df["timestamp_end"], errors='coerce')
 
-        # Handle events with missing end timestamps (assume they end at the time range's end)
-        operations_df["timestamp_end"] = operations_df["timestamp_end"].fillna(end_time)
+        # Fill missing end timestamps with the specified end_time
+        operations_df["timestamp_end"] = operations_df["timestamp_end"].fillna(pd.Timestamp(end_time))
 
-        # Calculate effective start and end times
-        operations_df["effective_start"] = operations_df[["timestamp_start", pd.Timestamp(start_time)]].max(axis=1)
-        operations_df["effective_end"] = operations_df[["timestamp_end", pd.Timestamp(end_time)]].min(axis=1)
+        # Calculate effective start and end times, clipped to the specified time range
+        operations_df["effective_start"] = operations_df["timestamp_start"].clip(lower=pd.Timestamp(start_time))
+        operations_df["effective_end"] = operations_df["timestamp_end"].clip(upper=pd.Timestamp(end_time))
 
-        # Calculate effective duration (clip to non-negative)
+        # Calculate effective duration in seconds, ensuring non-negative values
         operations_df["effective_duration"] = (
-            (operations_df["effective_end"] - operations_df["effective_start"]).dt.total_seconds().clip(lower=0)
-        )
+            (operations_df["effective_end"] - operations_df["effective_start"]).dt.total_seconds()
+        ).clip(lower=0)
 
-        # Remove rows where the event is completely out of bounds
+        # Remove rows with zero effective duration (completely outside the time range)
         operations_df = operations_df[operations_df["effective_duration"] > 0]
 
-        # Prorate value-added time for truncated events
+        # Calculate prorated value-added time for each row
         operations_df["prorated_value_added_time"] = operations_df.apply(
-            lambda row: self.calculate_prorated_value_added_time(
-                row["operation"], row["effective_duration"]
-            ),
+            lambda row: self.calculate_prorated_value_added_time(row["operation"], row["effective_duration"]),
             axis=1
         )
 
@@ -83,15 +82,15 @@ class OEECalculator:
         Returns:
             float: Prorated value-added time in seconds.
         """
-        # Validate the value-added time from the config
         if operation not in self.value_added_times:
-            import warnings
             warnings.warn(f"Operation '{operation}' not found in value-added times config. Defaulting to 0.")
             return 0
 
         standard_value_added_time = self.value_added_times[operation]
         if not isinstance(standard_value_added_time, (int, float)):
             raise ValueError(f"Value-added time for operation '{operation}' must be numeric.")
+        
+        # Return the minimum of effective duration and standard value-added time
         return min(effective_duration, standard_value_added_time)
 
     def calculate_oee(self, operations_df, start_time, end_time, overrides=None):
@@ -103,7 +102,6 @@ class OEECalculator:
             start_time (datetime): Start of the time range for OEE calculation.
             end_time (datetime): End of the time range for OEE calculation.
             overrides (dict): Optional mapping of operation IDs to overridden loss categories.
-                              Example: {"operation_1": "speed_loss"}
 
         Returns:
             dict: OEE metrics including availability, performance, quality, and overall OEE.
@@ -111,13 +109,11 @@ class OEECalculator:
         # Apply truncation for the time range
         truncated_df = self.truncate_events(operations_df, start_time, end_time)
 
-        # Handle overrides for loss categories
+        # Apply overrides for loss categories if provided
         if overrides:
-            truncated_df["loss_category"] = truncated_df.apply(
-                lambda row: overrides.get(row["operation"], row["loss_category"]), axis=1
-            )
+            truncated_df["loss_category"] = truncated_df["operation"].map(overrides).fillna(truncated_df["loss_category"])
 
-        # If no valid events, return zero OEE metrics
+        # Handle case with no valid operations in the time range
         if truncated_df.empty:
             print(f"No valid operations found within the time range: {start_time} to {end_time}")
             return {
@@ -127,31 +123,31 @@ class OEECalculator:
                 "oee": 0,
             }
 
-        # Calculate total duration in the time range
+        # Calculate total time in the specified range
         total_time = truncated_df["effective_duration"].sum()
 
-        # Categorize losses
-        availability_losses = truncated_df[truncated_df["loss_category"].isin(
-            ["unplanned_stop", "planned_stop"]
-        )]["effective_duration"].sum()
+        # Aggregate losses by category
+        availability_losses = truncated_df.loc[
+            truncated_df["loss_category"].isin(["unplanned_stop", "planned_stop"]), "effective_duration"
+        ].sum()
 
-        performance_losses = truncated_df[truncated_df["loss_category"].isin(
-            ["small_stop", "speed_loss"]
-        )]["effective_duration"].sum()
+        performance_losses = truncated_df.loc[
+            truncated_df["loss_category"].isin(["small_stop", "speed_loss"]), "effective_duration"
+        ].sum()
 
-        quality_losses = truncated_df[truncated_df["loss_category"].isin(
-            ["rework/scrap", "startup_loss"]
-        )]["effective_duration"].sum()
+        quality_losses = truncated_df.loc[
+            truncated_df["loss_category"].isin(["rework/scrap", "startup_loss"]), "effective_duration"
+        ].sum()
 
-        # Value-added time
+        # Aggregate value-added time
         value_added_time = truncated_df["prorated_value_added_time"].sum()
 
-        # Avoid division by zero for OEE components
-        availability = max((total_time - availability_losses) / total_time, 0)
-        performance = max(1 - performance_losses / total_time, 0)
-        quality = max(1 - quality_losses / total_time, 0)
+        # Calculate OEE components (prevent division by zero)
+        availability = max((total_time - availability_losses) / total_time, 0) if total_time > 0 else 0
+        performance = max(1 - (performance_losses / total_time), 0) if total_time > 0 else 0
+        quality = max(1 - (quality_losses / total_time), 0) if total_time > 0 else 0
 
-        # Overall OEE
+        # Calculate overall OEE
         oee = availability * performance * quality
 
         return {
