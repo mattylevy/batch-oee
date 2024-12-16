@@ -123,8 +123,8 @@ class OEECalculator:
                 "oee": 0,
             }
 
-        # Calculate total time in the specified range
-        total_time = truncated_df["effective_duration"].sum()
+        # Calculate total time in of the time range 
+        total_time = (pd.Timestamp(end_time) - pd.Timestamp(start_time)).total_seconds()
 
         # Aggregate losses by category
         availability_losses = truncated_df.loc[
