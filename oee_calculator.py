@@ -12,7 +12,6 @@ class OEECalculator:
         Parameters:
             config_file (str): Path to a YAML file containing value-added times for each operation.
         """
-        # Load value-added times if a config file is provided; default to an empty dictionary otherwise
         self.value_added_times = self.load_value_added_times(config_file) if config_file else {}
 
     def load_value_added_times(self, config_file):
@@ -45,45 +44,46 @@ class OEECalculator:
         Returns:
             pd.DataFrame: DataFrame with truncated event durations and value-added times.
         """
-        # Ensure timestamps are converted to datetime objects
+        # Convert timestamps to datetime objects
         operations_df["timestamp_start"] = pd.to_datetime(operations_df["timestamp_start"])
         operations_df["timestamp_end"] = pd.to_datetime(operations_df["timestamp_end"], errors="coerce")
 
-        # Fill missing end timestamps with the specified end_time
+        # Fill missing end timestamps with the specified end_time (live/ongoing operation)
         operations_df["timestamp_end"] = operations_df["timestamp_end"].fillna(pd.Timestamp(end_time))
 
-        # Calculate effective start and end times, clipped to the specified time range
+        # Clip timestamps to the specified range
         operations_df["effective_start"] = operations_df["timestamp_start"].clip(lower=pd.Timestamp(start_time))
         operations_df["effective_end"] = operations_df["timestamp_end"].clip(upper=pd.Timestamp(end_time))
 
-        # Calculate effective duration in seconds, ensuring non-negative values
+        # Calculate effective duration in seconds
         operations_df["effective_duration"] = (
             (operations_df["effective_end"] - operations_df["effective_start"]).dt.total_seconds()
         ).clip(lower=0)
 
-        # Remove rows with zero effective duration (completely outside the time range)
+        # Drop rows with zero effective duration
         operations_df = operations_df[operations_df["effective_duration"] > 0]
 
-        # Calculate prorated value-added time for each row
+        # Calculate prorated value-added time
         operations_df["prorated_value_added_time"] = operations_df.apply(
             lambda row: self.calculate_prorated_value_added_time(
-                row["operation"], row["timestamp_start"], row["timestamp_end"], start_time, end_time
+                row["operation"], row["effective_start"], row["effective_end"]
             ),
             axis=1,
         )
 
+        # Debug: Save intermediate results
+        operations_df.to_csv("debug_truncated_events.csv", index=False)
+
         return operations_df
 
-    def calculate_prorated_value_added_time(self, operation, timestamp_start, timestamp_end, range_start, range_end):
+    def calculate_prorated_value_added_time(self, operation, effective_start, effective_end):
         """
-        Calculate prorated value-added time for a given operation within a specific time range.
+        Calculate prorated value-added time for a given operation based on effective start and end.
 
         Parameters:
             operation (str): The name of the operation.
-            timestamp_start (datetime): Actual start time of the operation.
-            timestamp_end (datetime): Actual end time of the operation.
-            range_start (datetime): Start of the time range.
-            range_end (datetime): End of the time range.
+            effective_start (datetime): Clipped start time.
+            effective_end (datetime): Clipped end time.
 
         Returns:
             float: Prorated value-added time in seconds.
@@ -92,56 +92,48 @@ class OEECalculator:
             warnings.warn(f"Operation '{operation}' not found in value-added times config. Defaulting to 0.")
             return 0
 
-        # Get the standard value-added time for the operation
-        standard_value_added_time = self.value_added_times[operation]
+        # Standard value-added time
+        standard_time = self.value_added_times[operation]
+        operation_duration = (effective_end - effective_start).total_seconds()
 
-        # Calculate expected end time using the standard value-added time
-        expected_end = timestamp_start + pd.Timedelta(seconds=standard_value_added_time)
-
-        # Determine the overlap between the expected value-added window and the specified range
-        overlap_start = max(timestamp_start, pd.Timestamp(range_start))
-        overlap_end = min(expected_end, pd.Timestamp(range_end))
-
-        # Calculate the overlap duration in seconds
-        overlap_duration = max((overlap_end - overlap_start).total_seconds(), 0)
-
-        # Return the prorated value-added time as the overlap duration
-        return overlap_duration
+        # Prorated value-added time cannot exceed the effective duration
+        return min(standard_time, operation_duration)
 
     def calculate_oee(self, operations_df, start_time, end_time, overrides=None):
         """
-        Calculate OEE metrics within a specific time range, accounting for default and overridden loss categories.
+        Calculate OEE metrics within a specific time range, with optional loss category overrides.
 
         Parameters:
-            operations_df (pd.DataFrame): Table of batch operations with default loss categories.
-            start_time (datetime): Start of the time range for OEE calculation.
-            end_time (datetime): End of the time range for OEE calculation.
+            operations_df (pd.DataFrame): Table of batch operations with optional loss categories.
+            start_time (datetime): Start of the time range.
+            end_time (datetime): End of the time range.
             overrides (dict): Optional mapping of operation IDs to overridden loss categories.
 
         Returns:
             dict: OEE metrics including availability, performance, quality, and overall OEE.
         """
-        # Apply truncation for the time range
+        # Apply truncation
         truncated_df = self.truncate_events(operations_df, start_time, end_time)
 
-        # Apply overrides for loss categories if provided
+        # Handle missing loss categories: default to 'unknown_loss'
+        truncated_df["loss_category"] = truncated_df.get("loss_category", "unknown_loss")
+
+        # Apply overrides if provided
         if overrides:
             truncated_df["loss_category"] = truncated_df["operation"].map(overrides).fillna(truncated_df["loss_category"])
 
-        # Handle case with no valid operations in the time range
+        # Debug: Save after truncation and overrides
+        truncated_df.to_csv("debug_after_overrides.csv", index=False)
+
+        # Handle case with no valid operations
         if truncated_df.empty:
             print(f"No valid operations found within the time range: {start_time} to {end_time}")
-            return {
-                "availability": 0,
-                "performance": 0,
-                "quality": 0,
-                "oee": 0,
-            }
+            return {"availability": 0, "performance": 0, "quality": 0, "oee": 0}
 
-        # Calculate total time in the time range
+        # Calculate total time in the range
         total_time = (pd.Timestamp(end_time) - pd.Timestamp(start_time)).total_seconds()
 
-        # Aggregate losses by category
+        # Aggregate losses
         availability_losses = truncated_df.loc[
             truncated_df["loss_category"].isin(["unplanned_stop", "planned_stop"]), "effective_duration"
         ].sum()
@@ -157,13 +149,16 @@ class OEECalculator:
         # Aggregate value-added time
         value_added_time = truncated_df["prorated_value_added_time"].sum()
 
-        # Calculate OEE components (prevent division by zero)
+        # Calculate components
         availability = max((total_time - availability_losses) / total_time, 0) if total_time > 0 else 0
         performance = max(1 - (performance_losses / total_time), 0) if total_time > 0 else 0
         quality = max(1 - (quality_losses / total_time), 0) if total_time > 0 else 0
 
-        # Calculate overall OEE
+        # Calculate OEE
         oee = availability * performance * quality
+
+        # Debug: Save final results
+        truncated_df.to_csv("debug_final_oee.csv", index=False)
 
         return {
             "availability": round(availability, 3),
